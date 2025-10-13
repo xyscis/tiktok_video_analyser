@@ -1,0 +1,620 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision.transforms as transforms
+import torchvision.models as models
+from PIL import Image
+import cv2
+import numpy as np
+import os
+import json
+import time
+from datetime import datetime
+import requests
+from typing import Dict, List, Optional
+
+# =====================================================
+# 1. TikTok Video Downloader
+# =====================================================
+
+class TikTokDownloader:
+    """Download TikTok videos for analysis"""
+    
+    def __init__(self, download_dir='tiktok_downloads'):
+        self.download_dir = download_dir
+        os.makedirs(download_dir, exist_ok=True)
+        
+    def download_from_url(self, video_url: str, filename: Optional[str] = None) -> str:
+        """
+        Download TikTok video from URL
+        Note: For production, use TikTok API or services like yt-dlp
+        """
+        try:
+            # Generate filename if not provided
+            if filename is None:
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                filename = f'tiktok_{timestamp}.mp4'
+            
+            output_path = os.path.join(self.download_dir, filename)
+            
+            # Using yt-dlp (recommended for TikTok downloads)
+            # Install: pip install yt-dlp
+            import yt_dlp
+            
+            ydl_opts = {
+                'outtmpl': output_path,
+                'format': 'best',
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                
+            print(f"✓ Downloaded: {filename}")
+            return output_path
+            
+        except Exception as e:
+            print(f"✗ Error downloading {video_url}: {str(e)}")
+            return None
+    
+    def download_user_videos(self, username: str, max_videos: int = 10, random_selection: bool = False) -> List[str]:
+        """
+        Download videos from a TikTok user
+        
+        Args:
+            username: TikTok username (without @)
+            max_videos: Maximum number of videos to download
+            random_selection: If True, randomly select from all available videos
+        """
+        try:
+            import yt_dlp
+            import random
+            
+            user_url = f'https://www.tiktok.com/@{username}'
+            
+            # First, get list of all available videos without downloading
+            ydl_opts_list = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': True,  # Don't download, just get video info
+            }
+            
+            all_video_ids = []
+            
+            with yt_dlp.YoutubeDL(ydl_opts_list) as ydl:
+                info = ydl.extract_info(user_url, download=False)
+                
+                if 'entries' in info:
+                    all_video_ids = [entry.get('id') for entry in info['entries'] if entry.get('id')]
+            
+            if not all_video_ids:
+                print(f"✗ No videos found for @{username}")
+                return []
+            
+            print(f"✓ Found {len(all_video_ids)} videos from @{username}")
+            
+            # Select videos to download
+            if random_selection and len(all_video_ids) > max_videos:
+                selected_ids = random.sample(all_video_ids, max_videos)
+                print(f"✓ Randomly selected {max_videos} videos")
+            else:
+                selected_ids = all_video_ids[:max_videos]
+                print(f"✓ Selected first {len(selected_ids)} videos")
+            
+            # Download selected videos
+            downloaded_files = []
+            
+            for i, video_id in enumerate(selected_ids):
+                print(f"  Downloading video {i+1}/{len(selected_ids)}...", end=' ')
+                
+                video_url = f'https://www.tiktok.com/@{username}/video/{video_id}'
+                
+                ydl_opts = {
+                    'outtmpl': os.path.join(self.download_dir, f'{username}_{video_id}.mp4'),
+                    'format': 'best',
+                    'quiet': True,
+                    'no_warnings': True,
+                }
+                
+                try:
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([video_url])
+                    
+                    filepath = os.path.join(self.download_dir, f'{username}_{video_id}.mp4')
+                    if os.path.exists(filepath):
+                        downloaded_files.append(filepath)
+                        print("✓")
+                    else:
+                        print("✗")
+                except Exception as e:
+                    print(f"✗ Error: {str(e)}")
+                
+                time.sleep(0.5)  # Rate limiting
+            
+            print(f"\n✓ Successfully downloaded {len(downloaded_files)}/{len(selected_ids)} videos")
+            return downloaded_files
+            
+        except Exception as e:
+            print(f"✗ Error downloading from @{username}: {str(e)}")
+            return []
+    
+    def download_from_list(self, url_list: List[str]) -> List[str]:
+        """Download multiple TikTok videos from a list of URLs"""
+        downloaded_files = []
+        
+        for i, url in enumerate(url_list):
+            print(f"Downloading {i+1}/{len(url_list)}...")
+            filepath = self.download_from_url(url, filename=f'tiktok_{i+1:03d}.mp4')
+            if filepath:
+                downloaded_files.append(filepath)
+            time.sleep(1)  # Rate limiting
+        
+        return downloaded_files
+
+# =====================================================
+# 2. Video Preprocessing
+# =====================================================
+
+class VideoProcessor:
+    """Extract and process frames from TikTok videos"""
+    
+    def __init__(self, target_size=(224, 224)):
+        self.target_size = target_size
+        
+    def extract_frames(self, video_path: str, num_frames: int = 16, 
+                      method: str = 'uniform') -> Optional[List[np.ndarray]]:
+        """
+        Extract frames from video
+        
+        Args:
+            video_path: Path to video file
+            num_frames: Number of frames to extract
+            method: 'uniform' (evenly spaced) or 'keyframes' (important frames)
+        """
+        cap = cv2.VideoCapture(video_path)
+        
+        if not cap.isOpened():
+            print(f"✗ Cannot open video: {video_path}")
+            return None
+        
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        
+        if total_frames == 0:
+            cap.release()
+            return None
+        
+        frames = []
+        
+        if method == 'uniform':
+            # Extract evenly spaced frames
+            frame_indices = np.linspace(0, total_frames - 1, num_frames, dtype=int)
+            
+            for idx in frame_indices:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = cap.read()
+                if ret:
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frames.append(frame)
+        
+        elif method == 'keyframes':
+            # Extract key frames (scene changes, high motion)
+            frame_idx = 0
+            prev_frame = None
+            differences = []
+            all_frames = []
+            
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                all_frames.append(frame_rgb)
+                
+                if prev_frame is not None:
+                    diff = cv2.absdiff(frame, prev_frame)
+                    diff_score = np.mean(diff)
+                    differences.append((frame_idx, diff_score))
+                
+                prev_frame = frame
+                frame_idx += 1
+            
+            # Select frames with highest differences
+            differences.sort(key=lambda x: x[1], reverse=True)
+            selected_indices = sorted([idx for idx, _ in differences[:num_frames]])
+            frames = [all_frames[idx] for idx in selected_indices if idx < len(all_frames)]
+        
+        cap.release()
+        
+        print(f"✓ Extracted {len(frames)} frames from {os.path.basename(video_path)}")
+        return frames if len(frames) > 0 else None
+    
+    def detect_faces(self, frame: np.ndarray) -> List[np.ndarray]:
+        """Detect faces in frame using Haar Cascade"""
+        face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+        gray = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
+        faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(30, 30))
+        
+        face_crops = []
+        for (x, y, w, h) in faces:
+            face_crop = frame[y:y+h, x:x+w]
+            face_crops.append(face_crop)
+        
+        return face_crops
+    
+    def preprocess_frames(self, frames: List[np.ndarray], 
+                         focus_on_faces: bool = True) -> List[Image.Image]:
+        """Preprocess frames for CNN input"""
+        processed = []
+        
+        for frame in frames:
+            if focus_on_faces:
+                faces = self.detect_faces(frame)
+                if faces:
+                    # Use the largest face
+                    face = max(faces, key=lambda x: x.shape[0] * x.shape[1])
+                    frame = face
+            
+            # Resize and convert to PIL
+            frame_resized = cv2.resize(frame, self.target_size)
+            pil_image = Image.fromarray(frame_resized)
+            processed.append(pil_image)
+        
+        return processed
+
+# =====================================================
+# 3. CNN Model Architecture
+# =====================================================
+
+class PersonalityCNN(nn.Module):
+    """CNN for predicting Big Five personality traits"""
+    
+    def __init__(self, num_traits=5, pretrained=True):
+        super(PersonalityCNN, self).__init__()
+        
+        # ResNet50 backbone
+        self.backbone = models.resnet50(pretrained=pretrained)
+        num_features = self.backbone.fc.in_features
+        self.backbone.fc = nn.Identity()
+        
+        # Attention mechanism
+        self.attention = nn.Sequential(
+            nn.Linear(num_features, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, num_features),
+            nn.Sigmoid()
+        )
+        
+        # Feature extraction
+        self.feature_extractor = nn.Sequential(
+            nn.Linear(num_features, 1024),
+            nn.ReLU(),
+            nn.BatchNorm1d(1024),
+            nn.Dropout(0.4),
+            nn.Linear(1024, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.3)
+        )
+        
+        # Personality trait heads
+        self.openness_head = nn.Linear(512, 1)
+        self.conscientiousness_head = nn.Linear(512, 1)
+        self.extraversion_head = nn.Linear(512, 1)
+        self.agreeableness_head = nn.Linear(512, 1)
+        self.neuroticism_head = nn.Linear(512, 1)
+        
+    def forward(self, x):
+        features = self.backbone(x)
+        attention_weights = self.attention(features)
+        features = features * attention_weights
+        features = self.feature_extractor(features)
+        
+        return {
+            'openness': torch.sigmoid(self.openness_head(features)) * 100,
+            'conscientiousness': torch.sigmoid(self.conscientiousness_head(features)) * 100,
+            'extraversion': torch.sigmoid(self.extraversion_head(features)) * 100,
+            'agreeableness': torch.sigmoid(self.agreeableness_head(features)) * 100,
+            'neuroticism': torch.sigmoid(self.neuroticism_head(features)) * 100
+        }
+
+# =====================================================
+# 4. TikTok Personality Analyzer (Main Pipeline)
+# =====================================================
+
+class TikTokPersonalityAnalyzer:
+    """Complete pipeline: Download -> Process -> Analyze"""
+    
+    def __init__(self, model_path: Optional[str] = None, device: str = 'cuda'):
+        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {self.device}")
+        
+        # Initialize components
+        self.downloader = TikTokDownloader()
+        self.processor = VideoProcessor()
+        
+        # Load or initialize model
+        self.model = PersonalityCNN(pretrained=True)
+        if model_path and os.path.exists(model_path):
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+            print(f"✓ Loaded model from {model_path}")
+        else:
+            print("⚠ Using pretrained backbone (not fine-tuned for personality)")
+        
+        self.model.to(self.device)
+        self.model.eval()
+        
+        # Image transforms
+        self.transform = transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    def analyze_video_url(self, tiktok_url: str, num_frames: int = 16) -> Dict:
+        """Analyze personality from TikTok URL"""
+        print(f"\n{'='*60}")
+        print(f"Analyzing: {tiktok_url}")
+        print(f"{'='*60}")
+        
+        # Step 1: Download video
+        print("\n[1/3] Downloading video...")
+        video_path = self.downloader.download_from_url(tiktok_url)
+        if not video_path:
+            return {'error': 'Failed to download video'}
+        
+        # Step 2: Extract and process frames
+        print("\n[2/3] Processing video frames...")
+        frames = self.processor.extract_frames(video_path, num_frames=num_frames)
+        if not frames:
+            return {'error': 'Failed to extract frames'}
+        
+        processed_frames = self.processor.preprocess_frames(frames, focus_on_faces=True)
+        
+        # Step 3: Predict personality
+        print("\n[3/3] Analyzing personality with CNN...")
+        results = self._predict_from_frames(processed_frames)
+        
+        # Add metadata
+        results['video_path'] = video_path
+        results['num_frames_analyzed'] = len(processed_frames)
+        results['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        return results
+    
+    def analyze_user(self, username: str, max_videos: int = 5, random_selection: bool = True) -> Dict:
+        """
+        Analyze personality from multiple videos of a user
+        
+        Args:
+            username: TikTok username (without @)
+            max_videos: Number of videos to analyze
+            random_selection: If True, randomly select videos instead of taking the first ones
+        """
+        print(f"\n{'='*60}")
+        print(f"Analyzing TikTok user: @{username}")
+        print(f"{'='*60}")
+        
+        # Download user videos
+        print(f"\nDownloading {max_videos} {'random' if random_selection else 'recent'} videos...")
+        video_paths = self.downloader.download_user_videos(
+            username, 
+            max_videos=max_videos,
+            random_selection=random_selection
+        )
+        
+        if not video_paths:
+            return {'error': 'Failed to download videos'}
+        
+        # Analyze each video
+        all_predictions = []
+        
+        for i, video_path in enumerate(video_paths):
+            print(f"\n--- Processing video {i+1}/{len(video_paths)} ---")
+            
+            frames = self.processor.extract_frames(video_path, num_frames=8)
+            if frames:
+                processed_frames = self.processor.preprocess_frames(frames, focus_on_faces=True)
+                prediction = self._predict_from_frames(processed_frames)
+                all_predictions.append(prediction)
+        
+        if not all_predictions:
+            return {'error': 'Failed to analyze videos'}
+        
+        # Aggregate predictions
+        aggregated = self._aggregate_predictions(all_predictions)
+        aggregated['username'] = username
+        aggregated['videos_analyzed'] = len(all_predictions)
+        aggregated['random_selection'] = random_selection
+        aggregated['timestamp'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        
+        return aggregated
+    
+    def _predict_from_frames(self, frames: List[Image.Image]) -> Dict:
+        """Predict personality from processed frames"""
+        # Transform frames
+        frame_tensors = [self.transform(frame) for frame in frames]
+        
+        # Average across frames
+        input_tensor = torch.stack(frame_tensors).mean(dim=0).unsqueeze(0)
+        input_tensor = input_tensor.to(self.device)
+        
+        # Predict
+        with torch.no_grad():
+            outputs = self.model(input_tensor)
+        
+        results = {
+            'openness': float(outputs['openness'].item()),
+            'conscientiousness': float(outputs['conscientiousness'].item()),
+            'extraversion': float(outputs['extraversion'].item()),
+            'agreeableness': float(outputs['agreeableness'].item()),
+            'neuroticism': float(outputs['neuroticism'].item())
+        }
+        
+        # Add interpretations
+        results['interpretation'] = self._interpret_personality(results)
+        
+        return results
+    
+    def _aggregate_predictions(self, predictions: List[Dict]) -> Dict:
+        """Aggregate predictions from multiple videos"""
+        traits = ['openness', 'conscientiousness', 'extraversion', 'agreeableness', 'neuroticism']
+        
+        aggregated = {}
+        for trait in traits:
+            values = [p[trait] for p in predictions]
+            aggregated[trait] = float(np.mean(values))
+            aggregated[f'{trait}_std'] = float(np.std(values))
+        
+        aggregated['interpretation'] = self._interpret_personality(aggregated)
+        
+        return aggregated
+    
+    def _interpret_personality(self, scores: Dict) -> Dict:
+        """Interpret personality scores"""
+        interpretation = {}
+        
+        # Openness
+        if scores['openness'] >= 70:
+            interpretation['openness'] = "Highly creative, curious, and open to new experiences"
+        elif scores['openness'] >= 50:
+            interpretation['openness'] = "Moderately open to new ideas and experiences"
+        else:
+            interpretation['openness'] = "Prefers routine and familiar experiences"
+        
+        # Conscientiousness
+        if scores['conscientiousness'] >= 70:
+            interpretation['conscientiousness'] = "Highly organized, responsible, and goal-oriented"
+        elif scores['conscientiousness'] >= 50:
+            interpretation['conscientiousness'] = "Moderately organized and reliable"
+        else:
+            interpretation['conscientiousness'] = "More spontaneous and flexible"
+        
+        # Extraversion
+        if scores['extraversion'] >= 70:
+            interpretation['extraversion'] = "Highly social, energetic, and outgoing"
+        elif scores['extraversion'] >= 50:
+            interpretation['extraversion'] = "Balanced between social and alone time"
+        else:
+            interpretation['extraversion'] = "More reserved and introspective"
+        
+        # Agreeableness
+        if scores['agreeableness'] >= 70:
+            interpretation['agreeableness'] = "Very cooperative, warm, and empathetic"
+        elif scores['agreeableness'] >= 50:
+            interpretation['agreeableness'] = "Balanced between cooperation and assertiveness"
+        else:
+            interpretation['agreeableness'] = "More competitive and direct"
+        
+        # Neuroticism
+        if scores['neuroticism'] >= 70:
+            interpretation['neuroticism'] = "More emotionally sensitive and reactive"
+        elif scores['neuroticism'] >= 50:
+            interpretation['neuroticism'] = "Moderate emotional stability"
+        else:
+            interpretation['neuroticism'] = "Very emotionally stable and calm"
+        
+        # Overall summary
+        dominant_trait = max(scores.items(), key=lambda x: x[1] if x[0] in ['openness', 'conscientiousness', 'extraversion', 'agreeableness'] else 0)
+        interpretation['dominant_trait'] = dominant_trait[0].capitalize()
+        
+        return interpretation
+    
+    def print_results(self, results: Dict):
+        """Pretty print analysis results"""
+        print(f"\n{'='*60}")
+        print("PERSONALITY ANALYSIS RESULTS")
+        print(f"{'='*60}\n")
+        
+        if 'error' in results:
+            print(f"Error: {results['error']}")
+            return
+        
+        traits = ['openness', 'conscientiousness', 'extraversion', 'agreeableness', 'neuroticism']
+        
+        print("Big Five Personality Traits:")
+        print("-" * 60)
+        for trait in traits:
+            score = results[trait]
+            bar_length = int(score / 2)
+            bar = "█" * bar_length + "░" * (50 - bar_length)
+            print(f"{trait.capitalize():20s} [{bar}] {score:.1f}%")
+            if 'interpretation' in results and trait in results['interpretation']:
+                print(f"{'':20s} → {results['interpretation'][trait]}")
+        
+        print("\n" + "=" * 60)
+        if 'dominant_trait' in results.get('interpretation', {}):
+            print(f"Dominant Trait: {results['interpretation']['dominant_trait']}")
+        
+        if 'videos_analyzed' in results:
+            print(f"Videos Analyzed: {results['videos_analyzed']}")
+        
+        print("=" * 60)
+
+# =====================================================
+# 5. Main Execution
+# =====================================================
+
+def main():
+    """
+    Main function: Analyze personality of a TikTok user from 5 random videos
+    """
+    
+    print("=" * 70)
+    print("  TikTok Personality Analyzer - Random Video Sampling")
+    print("=" * 70)
+    
+    # Initialize analyzer
+    analyzer = TikTokPersonalityAnalyzer(
+        model_path='best_personality_model.pth',  # Optional: use pre-trained model
+        device='cuda'
+    )
+    
+    # Get username from user input or use default
+    username = input("\nEnter TikTok username (without @): ").strip()
+    
+    if not username:
+        print("No username provided")
+    
+    # Analyze user with 5 random videos
+    print(f"\n🎯 Analyzing personality of @{username}")
+    print(f"📹 Selecting 5 random videos from their profile...")
+    print(f"🧠 Using CNN to determine personality traits...")
+    
+    results = analyzer.analyze_user(
+        username=username,
+        max_videos=5,
+        random_selection=True  # This ensures random selection
+    )
+    
+    # Display results
+    analyzer.print_results(results)
+    
+    # Save results to JSON file
+    output_filename = f"personality_analysis_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    with open(output_filename, 'w') as f:
+        json.dump(results, f, indent=2)
+    
+    print(f"\n💾 Results saved to: {output_filename}")
+    print(f"\n✅ Analysis complete!")
+    
+    # Optional: Ask if user wants to analyze another user
+    print("\n" + "=" * 70)
+    another = input("\nAnalyze another user? (y/n): ").strip().lower()
+    
+    if another == 'y':
+        main()  # Recursive call for another analysis
+
+if __name__ == '__main__':
+    main()
+
+# =====================================================
+# INSTALLATION REQUIREMENTS:
+# =====================================================
+# pip install torch torchvision opencv-python pillow numpy yt-dlp requests
+# 
+# Note: yt-dlp is the recommended tool for downloading TikTok videos
+# Alternative: playwright, selenium for browser automation

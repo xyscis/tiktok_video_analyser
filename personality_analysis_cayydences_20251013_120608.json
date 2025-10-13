@@ -1,0 +1,24 @@
+{
+  "openness": 49.741712188720705,
+  "openness_std": 0.08452939523872836,
+  "conscientiousness": 48.47507171630859,
+  "conscientiousness_std": 0.24665824046960916,
+  "extraversion": 49.36972351074219,
+  "extraversion_std": 0.39658678542946046,
+  "agreeableness": 50.742923736572266,
+  "agreeableness_std": 0.32249124565488085,
+  "neuroticism": 49.514886474609376,
+  "neuroticism_std": 0.25626147182239023,
+  "interpretation": {
+    "openness": "Prefers routine and familiar experiences",
+    "conscientiousness": "More spontaneous and flexible",
+    "extraversion": "More reserved and introspective",
+    "agreeableness": "Balanced between cooperation and assertiveness",
+    "neuroticism": "Very emotionally stable and calm",
+    "dominant_trait": "Agreeableness"
+  },
+  "username": "cayydences",
+  "videos_analyzed": 5,
+  "random_selection": true,
+  "timestamp": "2025-10-13 12:06:08"
+}
