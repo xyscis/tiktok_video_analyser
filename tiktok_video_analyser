@@ -617,4 +617,3 @@ if __name__ == '__main__':
 # pip install torch torchvision opencv-python pillow numpy yt-dlp requests
 # 
 # Note: yt-dlp is the recommended tool for downloading TikTok videos
-# Alternative: playwright, selenium for browser automation
